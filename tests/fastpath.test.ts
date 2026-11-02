@@ -194,6 +194,75 @@ test("in-place HEAD edit is caught by prefix-core comparison, uncredited, self-h
 
 const TAIL = (ids: string[]): Record<string, string> => ({ [PF_TAIL_IDS_HEADER]: ids.map(encodeURIComponent).join(",") });
 
+test("v4 count relaxation: a ledger-proven tail-id list carries the turn with NO count header", () => {
+    makeStubStore();
+    const session = freshSession("pf-v4-nocount");
+    const b1 = bodyOf([SYS("s"), USR("a"), USR("b")]);
+    assert.equal(runTurn(session, {}, b1).out.decision, "no-stamp"); // stampT=3
+    const b2 = bodyOf([SYS("s"), USR("a"), USR("b"), USR("c")]);
+    const h2 = runTurn(session, { ...TAIL(["h-b", "h-c"]) }, b2);
+    assert.equal(h2.out.decision, "hit(no-count)", LOGS.join("\n"));
+    assert.equal(h2.out.creditedMiss, false);
+    // the view must still be byte-for-byte the legacy full-parse oracle
+    if (!h2.out.hit) throw new Error("expected hit");
+    const oracle = openaiToCore(JSON.parse(b2));
+    assert.equal(h2.out.hit.view.length, oracle.msgs.length);
+    for (let i = 0; i < oracle.msgs.length; i++) {
+        assert.equal(h2.out.hit.view[i]!.id, oracle.msgs[i]!.id, `id @${i}`);
+        assert.equal((h2.out.hit.view[i]! as { wireIndex?: number }).wireIndex,
+            (oracle.msgs[i]! as { wireIndex?: number }).wireIndex, `wireIndex @${i}`);
+    }
+    // the restamp taught the client the true total; the next turn echoes it
+    // normally and the plain-string decision returns
+    const b3 = bodyOf([SYS("s"), USR("a"), USR("b"), USR("c"), USR("d")]);
+    const h3 = runTurn(session, { [PF_COUNT_HEADER]: "4", ...TAIL(["h-c", "h-d"]) }, b3);
+    assert.equal(h3.out.decision, "hit", LOGS.join("\n"));
+});
+
+test("v4 count relaxation: desynced echoes (high AND low) degrade to diagnostic, never breaker fuel", () => {
+    makeStubStore();
+    const session = freshSession("pf-v4-desync");
+    const b1 = bodyOf([SYS("s"), USR("a")]);
+    assert.equal(runTurn(session, {}, b1).out.decision, "no-stamp"); // stampT=2
+    // HIGH desync: the echo exceeds even the CURRENT body size (an older,
+    // larger stamp survived a lost response) — pre-v4 this was a CREDITED
+    // "ahead" miss; v4 trusts the ledger-proven list instead
+    const b2 = bodyOf([SYS("s"), USR("a"), USR("u1")]);
+    const h2 = runTurn(session, { [PF_COUNT_HEADER]: "9", ...TAIL(["u-prev", "u-u1"]) }, b2);
+    assert.equal(h2.out.decision, "hit(count-off=9)", LOGS.join("\n"));
+    assert.equal(h2.out.creditedMiss, false);
+    // LOW desync: the echo lags behind the server's own bookkeeping —
+    // pre-v4 this was "seed-stale"
+    const b3 = bodyOf([SYS("s"), USR("a"), USR("u1"), USR("u2")]);
+    const h3 = runTurn(session, { [PF_COUNT_HEADER]: "2", ...TAIL(["u-u1", "u-u2"]) }, b3);
+    assert.equal(h3.out.decision, "hit(count-off=2)", LOGS.join("\n"));
+    assert.equal(h3.out.creditedMiss, false);
+    assert.equal(watermarkDebugState(session).missCount ?? 0, 0, "diagnostic drift must never feed the breaker");
+});
+
+test("v4 count relaxation: malformed lists do NOT unlock the relaxation; shrink turns stay caught; zero-delta keeps no-progress", () => {
+    makeStubStore();
+    const session = freshSession("pf-v4-neg");
+    const b1 = bodyOf([SYS("s"), USR("a")]);
+    assert.equal(runTurn(session, {}, b1).out.decision, "no-stamp"); // stampT=2
+    // malformed header + no count: the pre-v4 ladder runs untouched
+    const r1 = runTurn(session, { [PF_TAIL_IDS_HEADER]: "x%zz,x%zz" }, bodyOf([SYS("s"), USR("a"), USR("u1")]));
+    assert.equal(r1.out.decision, "no-stamp", LOGS.join("\n"));
+    assert.equal(r1.out.creditedMiss, false);
+    // destructive prefix SHRINK with a plausible-looking id list: the width
+    // arithmetic demands T - stampT + 1 <= 0, so ids cannot prove anything
+    // here and the credited ahead verdict fires exactly as pre-v4
+    const shrunk = bodyOf([SYS("s"), USR("brand-new-tail")]);
+    const r2 = runTurn(session, { [PF_COUNT_HEADER]: "7", ...TAIL(["x", "y"]) }, shrunk);
+    assert.equal(r2.out.decision, "ahead", LOGS.join("\n"));
+    assert.equal(r2.out.creditedMiss, true);
+    // zero delta (T === stampT) with a ledger-valid 1-element list: kept as
+    // no-progress — an empty window would pin an empty lastMessages baseline
+    const r3 = runTurn(session, { [PF_COUNT_HEADER]: "2", ...TAIL(["solo"]) }, bodyOf([SYS("s"), USR("a")]));
+    assert.equal(r3.out.decision, "no-progress", LOGS.join("\n"));
+    assert.equal(r3.out.creditedMiss, false);
+});
+
 test("tail-ids: prevId chain rides consecutive hits; a broken anchor is uncredited and self-heals", () => {
     makeStubStore();
     const session = freshSession("pf-tailids");

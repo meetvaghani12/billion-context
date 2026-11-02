@@ -17,9 +17,10 @@
 //
 // Fail-soft contract (anti-deviation lock): the legacy pipeline is UNTOUCHED
 // code — this module only swaps the inputs the caller feeds it when EVERY
-// gate agrees. Any doubt (missing/garbage/stale stamp, count regression or
-// leap, model switch, head-system drift, a system/developer element at the
-// window head — hoist hazard — broken scan, armed breaker) falls back to the
+// gate agrees. Any doubt (missing/garbage stamp — UNLESS a ledger-proven
+// tail-id list carries the request, #5403/#5418 v4 count relaxation —
+// model switch, head-system drift, a system/developer element at the window
+// head — hoist hazard — broken scan, armed breaker) falls back to the
 // legacy path for that turn, and the response re-stamps the freshly measured
 // T so the client converges within one round-trip.
 //
@@ -28,7 +29,8 @@
 // cost of skipping byte-level re-verification). Destructive rewrites —
 // announced compaction, truncation, reorders that add/remove elements —
 // change the count and are caught by the k-behind/k-ahead verdicts before
-// any stale core could feed the kernel.
+// any stale core could feed the kernel; under v4 (count relaxation below)
+// the catch moves from the client echo to the ledger width arithmetic itself.
 import type { CoreMessage } from "acp-kernel";
 import type { OpenAIRequestBody } from "acp-kernel/wire";
 import { openaiToCore } from "acp-kernel/wire";
@@ -235,14 +237,39 @@ export function evaluateWatermarkFastpath(
         log("info", `[${session.id}] watermark fastpath miss (${decision}) — legacy full-parse this turn`);
         return { hit: null, measuredT: T, decision, creditedMiss: credited, receivedTailIds };
     };
-    if (Number.isNaN(stamped)) return miss("no-stamp", false);
-    if (stamped > T) return miss("ahead", true);
-    if (stamped === T) return miss("no-progress", false);
-    // stamped < T from here.
     const seed = seeds.get(session);
-    if (seed !== undefined && seed.stampT === stamped && seed.model === input.model) {
+    const rawTailIds = req.headers[PF_TAIL_IDS_HEADER];
+    // three states: undefined = header absent (pure count mode); null =
+    // present but malformed; array = shape-valid.
+    const parsedTailIds = rawTailIds === undefined ? undefined : typeof rawTailIds === "string" ? parseTailIds(rawTailIds) : null;
+    // #5403/#5418 v4 count relaxation (owner ruling 2026-11-02): once a
+    // session carries a ledger-proven tail-id list whose WIDTH matches its own
+    // bookkeeping (len = T - seed.stampT + 1), msgid continuity proves the
+    // window origin — the echoed x-bili-pf-count stops gating the hit and
+    // demotes to diagnostic (a desynced echo self-heals via the restamp).
+    // The length arithmetic is server-side: it re-verifies the exact width
+    // count used to assert, so trusting ids instead of the echo widens NO
+    // trust hole — prefix-shrink turns (compaction/truncation) yield a
+    // negative width, fail it, and fall into the untouched ahead/seed-stale
+    // verdicts. Zero delta (T === seed.stampT) keeps the no-progress miss:
+    // an empty window would pin an empty lastMessages baseline.
+    const idActive = parsedTailIds !== undefined && parsedTailIds !== null
+        && seed !== undefined && seed.model === input.model
+        && parsedTailIds.length === T - seed.stampT + 1;
+    if (Number.isNaN(stamped)) {
+        if (!idActive) return miss("no-stamp", false);
+    } else if (!idActive) {
+        if (stamped > T) return miss("ahead", true);
+        if (stamped === T) return miss("no-progress", false);
+    } else if (T === seed.stampT) {
+        return miss("no-progress", false);
+    }
+    if (seed !== undefined && seed.model === input.model && (idActive || seed.stampT === stamped)) {
         // --- hit candidate: verify head + decode window ---------------------
-        const K = stamped;
+        // K comes from the LEDGER (server-measured stampT), never from the
+        // client echo — identical in pure count mode, where the entry above
+        // proves stamped === stampT.
+        const K = seed.stampT;
         // #5418 v3 (owner ruling 2026-11-02): hosts compress/rewrite, so no
         // alignment proof may gate this channel — msgids are unique forever,
         // ORDER binds them inside the verified delta, and the byte-level head
@@ -251,12 +278,10 @@ export function evaluateWatermarkFastpath(
         // Shape faults are shim/proxy drift — SILENTLY uncredited, never
         // toward the breaker (the legacy path + restamp self-heal). Absent
         // header = pure count mode (every pre-v2 behavior unchanged).
-        const rawTailIds = req.headers[PF_TAIL_IDS_HEADER];
         let tailIds: string[] | undefined;
-        if (rawTailIds !== undefined) {
-            const parsed = typeof rawTailIds === "string" ? parseTailIds(rawTailIds) : null;
-            if (parsed === null || parsed.length !== T - K + 1) return miss("tail-ids-shape", false);
-            tailIds = parsed;
+        if (parsedTailIds !== undefined) {
+            if (parsedTailIds === null || parsedTailIds.length !== T - K + 1) return miss("tail-ids-shape", false);
+            tailIds = parsedTailIds;
             if (tailIds[0] !== PF_SLOT_UNKNOWN) {
                 const prevKnown = seed.lastTailIds !== undefined && seed.lastTailIds.length > 0 ? seed.lastTailIds[seed.lastTailIds.length - 1] : undefined;
                 // "?" on EITHER side = no identity claim — no penalty; the
@@ -308,6 +333,10 @@ export function evaluateWatermarkFastpath(
         const windowRaw = openaiToCore(windowFragment as OpenAIRequestBody);
         if (windowRaw.systemText.trim() !== "") return miss("window-system-head", true, tailIds);
         const rekeyedWindow = rekeyWindowCores(windowRaw.msgs, K, seed.cores);
+        // v4 diagnostics ride the decision string (the debug/panel surfaces
+        // already print it): pure count mode stays byte-identical "hit" —
+        // off-string variants are unreachable there (entry proved stamped===K).
+        const hitDecision = Number.isNaN(stamped) ? "hit(no-count)" : stamped === K ? "hit" : `hit(count-off=${stamped})`;
         return {
             hit: {
                 view: [...seed.cores, ...rekeyedWindow] as CoreMessage[],
@@ -320,7 +349,7 @@ export function evaluateWatermarkFastpath(
                 markerCounts: addStripCounts(seed.stripCounts, windowCounts),
             },
             measuredT: T,
-            decision: "hit",
+            decision: hitDecision,
             creditedMiss: false,
             receivedTailIds: tailIds,
         };
