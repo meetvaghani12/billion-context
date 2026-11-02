@@ -1503,7 +1503,12 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
         // MITM envs entirely (an http loopback target is never proxied).
         if (url.startsWith(`${origin}/`)) {
             state.onDispatch?.(url, "self");
-            const resp = await send(input, init);
+            // #5418: hosts that dial the proxy directly (dsh profile bundles,
+            // #809 attach probes) land here already addressed — stamp + learn
+            // here or their watermark channel silently never seeds.
+            const selfStamp = withHeaders(input, init, pfChannel.pfRequestHeaders(outgoingHeadersOf(input, init) ?? {}));
+            const resp = await send(selfStamp.input, selfStamp.init);
+            pfChannel.pfLearnStamp(outgoingHeadersOf(selfStamp.input, selfStamp.init) ?? {}, resp.status, resp.headers);
             noteDispatchMode("proxy");
             return resp;
         }

@@ -142,6 +142,29 @@ test("chokepoint: routed model request carries count+tail-ids; the response lear
     assert.ok(!("x-bili-plugin" in sink[1].headers), "chokepoint must not add a lane plugin header");
 });
 
+test("chokepoint: direct-to-proxy self-branch emits and learns (dsh profile shape, #5418)", async () => {
+    const sid = "sid-e2e-self-1";
+    const { sink } = await withPfPatch(async (fetch, sinkIn) => {
+        // dsh profile bundles point the provider straight at the proxy root
+        // (default origin of withPfPatch); turn 1 unseeded
+        await fetch("http://127.0.0.1:41001/v1/chat/completions", {
+            method: "POST",
+            headers: { [CONVO]: sid },
+            body: "{}",
+        });
+        pfChannel.pfLearnStamp({ [CONVO]: sid }, 200, new Headers({ "x-bili-pf-seq": "4" }));
+        pfChannel.pfCaptureIds(sid, ["n1", "n2", "n3", "n4", "n5"]);
+        await fetch("http://127.0.0.1:41001/v1/chat/completions", {
+            method: "POST",
+            headers: { [CONVO]: sid },
+            body: "{}",
+        });
+        assert.equal(sinkIn[0].headers["x-bili-pf-count"], undefined, "turn 1 unseeded on the self branch too");
+    });
+    assert.equal(sink[1].headers["x-bili-pf-count"], "4");
+    assert.equal(sink[1].headers["x-bili-pf-tail-ids"], "n4,n5");
+});
+
 test("chokepoint: already-routed /bili/ MODEL url is stamped; __bili/ control-plane never is", async () => {
     const sid = "sid-e2e-control-1";
     learn({ [CONVO]: sid }, "4");
